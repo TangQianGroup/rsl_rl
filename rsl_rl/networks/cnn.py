@@ -9,6 +9,7 @@ import math
 import torch
 from torch import nn as nn
 
+from rsl_rl.networks import MLP
 from rsl_rl.utils import get_param, resolve_nn_activation
 
 
@@ -33,6 +34,11 @@ class CNN(nn.Sequential):
         max_pool: bool | tuple[bool] | list[bool] = False,
         global_pool: str = "none",
         flatten: bool = True,
+        # New parameters for fully connected layers
+        fc_output_dim: int | tuple[int] | list[int] | None = None,
+        fc_hidden_dims: tuple[int] | list[int] | None = None,
+        fc_activation: str = "elu",
+        fc_last_activation: str | None = None,
     ) -> None:
         """Initialize the CNN.
 
@@ -51,6 +57,10 @@ class CNN(nn.Sequential):
                 single boolean for all layers.
             global_pool: Global pooling type to apply at the end. Either 'none', 'max', or 'avg'.
             flatten: Whether to flatten the output tensor.
+            fc_hidden_dims: Dimensions of the hidden layers for fully connected part. None means no FC layers.
+            fc_output_dim: Dimension of the output for fully connected part. Required if fc_hidden_dims is not None.
+            fc_activation: Activation function for fully connected layers.
+            fc_last_activation: Activation function of the last fully connected layer. None results in a linear last layer.
         """
         super().__init__()
 
@@ -133,8 +143,31 @@ class CNN(nn.Sequential):
             layers.append(nn.Flatten(start_dim=1))
 
         # Store final output dimension
+        conv_output_dim = last_channels * last_dim[0] * last_dim[1] if flatten else last_dim
         self._output_channels = last_channels if not flatten else None
-        self._output_dim = last_dim if not flatten else last_channels * last_dim[0] * last_dim[1]
+        self._output_dim = conv_output_dim
+
+        # Add fully connected layers if specified
+        self.has_fc = fc_hidden_dims is not None
+        if self.has_fc:
+            if fc_output_dim is None:
+                raise ValueError("fc_output_dim must be specified when fc_hidden_dims is not None")
+                
+            # Create MLP for fully connected layers
+            fc_input_dim = conv_output_dim if isinstance(conv_output_dim, int) else conv_output_dim[0] * conv_output_dim[1] * conv_output_dim[2]
+            mlp = MLP(
+                input_dim=fc_input_dim,
+                output_dim=fc_output_dim,
+                hidden_dims=fc_hidden_dims,
+                activation=fc_activation,
+                last_activation=fc_last_activation,
+            )
+            
+            # Add MLP to layers
+            layers.append(mlp)
+            
+            # Update output dimension
+            self._output_dim = fc_output_dim
 
         # Register the layers
         for idx, layer in enumerate(layers):
@@ -146,7 +179,7 @@ class CNN(nn.Sequential):
         return self._output_channels
 
     @property
-    def output_dim(self) -> tuple[int, int] | int:
+    def output_dim(self) -> tuple[int, int] | int | tuple[int] | list[int]:
         """Get the output height and width or total output dimension if output is flattened."""
         return self._output_dim
 
@@ -156,6 +189,9 @@ class CNN(nn.Sequential):
             if isinstance(module, nn.Conv2d):
                 torch.nn.init.kaiming_normal_(module.weight)
                 torch.nn.init.zeros_(module.bias)
+            elif isinstance(module, MLP):
+                # Initialize MLP weights with default scales
+                module.init_weights(1.0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the CNN."""

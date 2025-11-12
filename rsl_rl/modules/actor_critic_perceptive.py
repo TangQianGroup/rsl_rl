@@ -28,7 +28,10 @@ class ActorCriticPerceptive(ActorCritic):
         critic_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
         actor_cnn_cfg: dict[str, dict] | dict | None = None,
         critic_cnn_cfg: dict[str, dict] | dict | None = None,
-        activation: str = "elu",
+        actor_activation: str = "elu",
+        actor_last_activation: str | None = None,
+        critic_activation: str = "elu",
+        critic_last_activation: str | None = None,
         init_noise_std: float = 1.0,
         noise_std_type: str = "scalar",
         state_dependent_std: bool = False,
@@ -114,9 +117,9 @@ class ActorCriticPerceptive(ActorCritic):
         # Actor MLP
         self.state_dependent_std = state_dependent_std
         if self.state_dependent_std:
-            self.actor = MLP(num_actor_obs_1d + encoding_dim, [2, num_actions], actor_hidden_dims, activation)
+            self.actor = MLP(num_actor_obs_1d + encoding_dim, [2, num_actions], actor_hidden_dims, actor_activation, actor_last_activation)
         else:
-            self.actor = MLP(num_actor_obs_1d + encoding_dim, num_actions, actor_hidden_dims, activation)
+            self.actor = MLP(num_actor_obs_1d + encoding_dim, num_actions, actor_hidden_dims, actor_activation, actor_last_activation)
         print(f"Actor MLP: {self.actor}")
 
         # Actor observation normalization (only for 1D actor observations)
@@ -164,7 +167,7 @@ class ActorCriticPerceptive(ActorCritic):
             encoding_dim = 0
 
         # Critic MLP
-        self.critic = MLP(num_critic_obs_1d + encoding_dim, 1, critic_hidden_dims, activation)
+        self.critic = MLP(num_critic_obs_1d + encoding_dim, 1, critic_hidden_dims, critic_activation, critic_last_activation)
         print(f"Critic MLP: {self.critic}")
 
         # Critic observation normalization (only for 1D critic observations)
