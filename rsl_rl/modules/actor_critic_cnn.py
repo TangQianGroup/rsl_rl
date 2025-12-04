@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
+import ipdb
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
-from torch.distributions import Normal
-from typing import Any
+from torch.distributions import Normal, Categorical, Independent
+from typing import Any, Tuple, List
 
 from rsl_rl.networks import CNN, MLP, EmpiricalNormalization
 
@@ -22,6 +23,7 @@ class ActorCriticCNN(ActorCritic):
         obs: TensorDict,
         obs_groups: dict[str, list[str]],
         num_actions: int,
+        num_discrete_actions: int = 0,
         actor_obs_normalization: bool = False,
         critic_obs_normalization: bool = False,
         actor_hidden_dims: tuple[int] | list[int] = [256, 256, 256],
@@ -29,7 +31,7 @@ class ActorCriticCNN(ActorCritic):
         actor_cnn_cfg: dict[str, dict] | dict | None = None,
         critic_cnn_cfg: dict[str, dict] | dict | None = None,
         actor_activation: str = "elu",
-        actor_last_activation: str | None = None,
+        actor_last_activation: tuple[str] | None = None,
         critic_activation: str = "elu",
         critic_last_activation: str | None = None,
         init_noise_std: float = 1.0,
@@ -43,6 +45,10 @@ class ActorCriticCNN(ActorCritic):
                 + str([key for key in kwargs])
             )
         super(ActorCritic, self).__init__()
+
+        # Store action dimensions
+        self.num_continuous_actions = num_actions - num_discrete_actions
+        self.num_discrete_actions = num_discrete_actions
 
         # Get the observation dimensions
         self.obs_groups = obs_groups
@@ -115,11 +121,22 @@ class ActorCriticCNN(ActorCritic):
 
         # Actor MLP
         self.state_dependent_std = state_dependent_std
-        if self.state_dependent_std:
-            self.actor = MLP(num_actor_obs_1d + encoding_dim, [2, num_actions], actor_hidden_dims, actor_activation, actor_last_activation)
+        # Actor Continuous MLP
+        if self.num_continuous_actions > 0:
+            if self.state_dependent_std:
+                self.actor_continuous = MLP(num_actor_obs_1d + encoding_dim, [2, self.num_continuous_actions], actor_hidden_dims, actor_activation, actor_last_activation[0])
+            else:
+                self.actor_continuous = MLP(num_actor_obs_1d + encoding_dim, self.num_continuous_actions, actor_hidden_dims, actor_activation, actor_last_activation[0])
+            print(f"Actor Continuous MLP: {self.actor_continuous}")
         else:
-            self.actor = MLP(num_actor_obs_1d + encoding_dim, num_actions, actor_hidden_dims, actor_activation, actor_last_activation)
-        print(f"Actor MLP: {self.actor}")
+            self.actor_continuous = None
+
+        # Actor Discrete MLP
+        if self.num_discrete_actions > 0:
+            self.actor_discrete = MLP(num_actor_obs_1d + encoding_dim, self.num_discrete_actions, actor_hidden_dims, actor_activation, actor_last_activation[1])
+            print(f"Actor Discrete MLP: {self.actor_discrete}")
+        else:
+            self.actor_discrete = None
 
         # Actor observation normalization (only for 1D actor observations)
         self.actor_obs_normalization = actor_obs_normalization
@@ -170,29 +187,30 @@ class ActorCriticCNN(ActorCritic):
         else:
             self.critic_obs_normalizer = torch.nn.Identity()
 
-        # Action noise
+        # Action noise for continuous actions
         self.noise_std_type = noise_std_type
-        if self.state_dependent_std:
-            torch.nn.init.zeros_(self.actor[-2].weight[num_actions:])
+        if self.num_continuous_actions > 0 and self.state_dependent_std:
+            torch.nn.init.zeros_(self.actor_continuous[-2].weight[self.num_continuous_actions:])
             if self.noise_std_type == "scalar":
-                torch.nn.init.constant_(self.actor[-2].bias[num_actions:], init_noise_std)
+                torch.nn.init.constant_(self.actor_continuous[-2].bias[self.num_continuous_actions:], init_noise_std)
             elif self.noise_std_type == "log":
                 torch.nn.init.constant_(
-                    self.actor[-2].bias[num_actions:], torch.log(torch.tensor(init_noise_std + 1e-7))
+                    self.actor_continuous[-2].bias[self.num_continuous_actions:], torch.log(torch.tensor(init_noise_std + 1e-7))
                 )
             else:
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-        else:
+        elif self.num_continuous_actions > 0:
             if self.noise_std_type == "scalar":
-                self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+                self.std = nn.Parameter(init_noise_std * torch.ones(self.num_continuous_actions))
             elif self.noise_std_type == "log":
-                self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+                self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(self.num_continuous_actions)))
             else:
                 raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
-        # Action distribution
+        # Action distributions
         # Note: Populated in update_distribution
-        self.distribution = None
+        self.continuous_distribution = None
+        self.discrete_distribution = None
 
         # Disable args validation for speedup
         Normal.set_default_validate_args(False)
@@ -205,13 +223,48 @@ class ActorCriticCNN(ActorCritic):
             # Concatenate to the MLP observations
             mlp_obs = torch.cat([mlp_obs, cnn_enc], dim=-1)
 
-        super()._update_distribution(mlp_obs)
+        if self.num_continuous_actions > 0:
+            if self.state_dependent_std:
+                # Compute mean and standard deviation
+                mean_and_std = self.actor_continuous(mlp_obs)
+                if self.noise_std_type == "scalar":
+                    mean, std = torch.unbind(mean_and_std, dim=-2)
+                elif self.noise_std_type == "log":
+                    mean, log_std = torch.unbind(mean_and_std, dim=-2)
+                    std = torch.exp(log_std)
+                else:
+                    raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+            else:
+                # Compute mean
+                mean = self.actor_continuous(mlp_obs)
+                # Compute standard deviation
+                if self.noise_std_type == "scalar":
+                    std = self.std.expand_as(mean)
+                elif self.noise_std_type == "log":
+                    std = torch.exp(self.log_std).expand_as(mean)
+                else:
+                    raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+            # Create continuous distribution
+            self.continuous_distribution = Normal(mean, std)
+
+        if self.num_discrete_actions > 0:
+            logits = self.actor_discrete(mlp_obs)
+            self.discrete_distribution = Categorical(logits=logits)
 
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         mlp_obs, cnn_obs = self.get_actor_obs(obs)
         mlp_obs = self.actor_obs_normalizer(mlp_obs)
         self._update_distribution(mlp_obs, cnn_obs)
-        return self.distribution.sample()  # type: ignore
+        
+        actions = []
+        if self.num_continuous_actions > 0:
+            continuous_actions = self.continuous_distribution.sample()
+            actions.append(continuous_actions)
+        if self.num_discrete_actions > 0:
+            discrete_probs = self.discrete_distribution.probs
+            actions.append(discrete_probs)
+
+        return torch.cat(actions, dim=-1)
 
     def act_inference(self, obs: TensorDict) -> torch.Tensor:
         mlp_obs, cnn_obs = self.get_actor_obs(obs)
@@ -224,10 +277,19 @@ class ActorCriticCNN(ActorCritic):
             # Concatenate to the MLP observations
             mlp_obs = torch.cat([mlp_obs, cnn_enc], dim=-1)
 
-        if self.state_dependent_std:
-            return self.actor(mlp_obs)[..., 0, :]
-        else:
-            return self.actor(mlp_obs)
+        actions = []
+        if self.num_continuous_actions > 0:
+            if self.state_dependent_std:
+                continuous_actions = self.actor_continuous(mlp_obs)[..., 0, :]
+            else:
+                continuous_actions = self.actor_continuous(mlp_obs)
+            actions.append(continuous_actions)
+        if self.num_discrete_actions > 0:
+            logits = self.actor_discrete(mlp_obs)
+            discrete_actions = Categorical(logits=logits).probs
+            actions.append(discrete_actions)
+        
+        return torch.cat(actions, dim=-1)
 
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         mlp_obs, cnn_obs = self.get_critic_obs(obs)
@@ -241,6 +303,58 @@ class ActorCriticCNN(ActorCritic):
             mlp_obs = torch.cat([mlp_obs, cnn_enc], dim=-1)
 
         return self.critic(mlp_obs)
+
+    def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        log_probs = []
+
+        continuous_actions = actions[..., :self.num_continuous_actions]
+        discrete_actions = actions[..., self.num_continuous_actions:]
+
+        if self.continuous_distribution is not None:
+            log_prob_continuous = self.continuous_distribution.log_prob(continuous_actions)
+            log_probs.append(log_prob_continuous)
+        
+        if self.discrete_distribution is not None:
+            log_prob_discrete = self.discrete_distribution.log_prob(torch.argmax(discrete_actions, dim=-1)).unsqueeze(-1)
+            log_probs.append(log_prob_discrete)
+        
+        return torch.cat(log_probs, dim=-1).sum(dim=-1)
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        entropies = []
+        
+        if self.continuous_distribution is not None:
+            entropies.append(self.continuous_distribution.entropy())
+        if self.discrete_distribution is not None:
+            entropies.append(self.discrete_distribution.entropy().unsqueeze(-1))
+        
+        return torch.cat(entropies, dim=-1).sum(dim=-1)
+    
+    @property
+    def action_mean(self) -> torch.Tensor:
+        actions = []
+        if self.num_continuous_actions > 0 and self.continuous_distribution is not None:
+            actions.append(self.continuous_distribution.mean)
+        if self.num_discrete_actions > 0 and self.discrete_distribution is not None:
+            max_indices = self.discrete_distribution.probs
+            actions.append(max_indices)
+        
+        if not actions:
+            raise ValueError("No valid action distributions found")
+        
+        return torch.cat(actions, dim=-1)
+
+    @property
+    def action_std(self) -> torch.Tensor:
+        if self.num_continuous_actions > 0 and self.continuous_distribution is not None:
+            std = self.continuous_distribution.stddev
+            if self.num_discrete_actions > 0:
+                # 为离散部分添加0方差（确定性）
+                zeros = torch.zeros(*std.shape[:-1], self.num_discrete_actions, device=std.device)
+                std = torch.cat([std, zeros], dim=-1)
+            return std
+        return torch.zeros(*self.action_mean.shape, device=self.action_mean.device)
 
     def get_actor_obs(self, obs: TensorDict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         obs_list_1d = [obs[obs_group] for obs_group in self.actor_obs_groups_1d]
